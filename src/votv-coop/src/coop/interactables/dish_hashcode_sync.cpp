@@ -36,6 +36,7 @@ UE_FACT_FN(kRowGenerteHashcode, "dish_hashcode_sync", L"dish_C", L"generteHashco
 constexpr int kTagRoll = 0x44484301;  // 'DHC' 1
 constexpr int kMaxDishIndex = 64;     // gamemode.dishs holds 24 on this map; the digest reads up to 64
 constexpr auto kRetry = std::chrono::seconds(1);
+constexpr auto kFullResyncInterval = std::chrono::seconds(5);
 
 std::atomic<coop::net::Session*> g_session{nullptr};
 bool g_watched = false;
@@ -46,6 +47,7 @@ bool g_settled = false;
 uint64_t g_marked = 0;
 bool g_owed[coop::net::kMaxPeers] = {};
 Clock::time_point g_nextSend{};
+Clock::time_point g_nextFullResync{};
 uint32_t g_seq = 1;
 bool g_saidUnindexed = false;
 bool g_saidUnreadable = false;
@@ -166,6 +168,18 @@ void TickHost(coop::net::Session* s) {
         }
         g_owed[slot] = false;
     }
+    
+if (now >= g_nextFullResync) {
+    g_nextFullResync = now + kFullResyncInterval;
+    for (int slot = 1; slot < coop::net::kMaxPeers; ++slot) {
+        if (!s->IsSlotWorldReady(slot) || g_owed[slot]) continue;
+        if (!SendSetTo(s, slot)) {
+            g_nextFullResync = now + kRetry;
+            break;
+        }
+    }
+}
+
 }
 
 // False while the dish is not there to take the row.
@@ -284,7 +298,7 @@ void OnDisconnect() {
     for (bool& o : g_owed) o = false;
     g_waiting.clear();
     g_asm.Clear();
-    g_nextSend = g_nextSweep = {};
+    g_nextSend = g_nextSweep = g_nextFullResync = {};
     g_saidUnindexed = g_saidUnreadable = false;
     if (g_refused)
         UE_LOGI("dish_hashcode_sync: session end -- %llu generteHashcode call(s) of this client's own refused",
