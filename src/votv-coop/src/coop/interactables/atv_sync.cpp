@@ -313,6 +313,14 @@ size_t HubPassComplete(void*, bool isFull, uint32_t worldGen) {
         if (e.actor && e.actor != f.obj) {
             e.occupantSlot = 0xFF; e.authorSlot = 0xFF;
             e.wasPoseAuthor = false;
+            
+            e.lastHostFuel = 0.0f;
+            e.lastHostFuelMs = 0;
+            e.haveLastHostFuel = false;
+            e.wasLocalFuelDriver = false;        
+            e.mountFuelCheckAtMs = 0;
+
+
             e.haveLastSync = false; e.lastIdleSendMs = 0; e.lastPktMs = 0;
             e.lastErrCm = -1.f; e.stallPackets = 0; e.restReplaces = 0; e.lastRestPlaceMs = 0;
         }
@@ -434,7 +442,28 @@ void OnReliable(const coop::net::AtvStatePayload& payload, uint8_t senderPeerSlo
     }
 
     // Our own authority ignores the incoming pose, so a relayed copy cannot fight the live drive.
-    if (IsPoseAuthor(e.actor, localPlayer, e.occupantSlot, localSlot)) return;
+    
+
+    // Remember the latest valid idle ATV fuel value from the host.
+    // Cache zero too, so an old positive value cannot be reused.
+    if (localSlot != 0 && senderPeerSlot == 0 &&
+        payload.occupantSlot == 0xFF &&
+        payload.tiresValid && std::isfinite(payload.fuel)) {
+        if (!e.haveLastHostFuel ||
+            std::fabs(e.lastHostFuel - payload.fuel) > 0.01f) {
+            UE_LOGI("atv_fuel_fix: host fuel for '%ls' = %.2f",
+                    key.c_str(), payload.fuel);
+        }
+        e.lastHostFuel = payload.fuel;
+        e.lastHostFuelMs = NowMs();
+        e.haveLastHostFuel = true;
+    }
+
+    // Keep local driving authority; do not apply remote pose.
+    if (IsPoseAuthor(e.actor, localPlayer, e.occupantSlot, localSlot))
+        return;
+
+
 
     // The seat and author, if the sender may name them.
     if (!SenderMaySpeakFor(senderPeerSlot, payload.authorSlot) ||
@@ -603,6 +632,66 @@ void Tick() {
         const bool isDriver  = CanClaimOrIsDriver(e.actor, localPlayer, e.occupantSlot, localSlot);
         const bool isGrabber = !isDriver && IsLocalGrabber(e.actor, localPlayer);  // mutually exclusive
         const bool authority = isDriver || isGrabber;
+        
+        // One-time fuel repair when the client mounts the ATV.
+        if (!isHost && isDriver && !e.wasLocalFuelDriver) {
+            ue_wrap::atv_condition::Snapshot fuelState{};
+            const bool readable =
+                ue_wrap::atv_condition::Read(e.actor, fuelState);
+            const bool fresh =
+                e.haveLastHostFuel &&
+                nowMs >= e.lastHostFuelMs &&
+                nowMs - e.lastHostFuelMs <= 10000;
+
+            UE_LOGI(
+                "atv_fuel_fix: MOUNT '%ls' readable=%d local=%.2f cached=%d host=%.2f age=%llu ms",
+                kv.first.c_str(), readable ? 1 : 0,
+                readable ? fuelState.fuel : -1.0f,
+                fresh ? 1 : 0, e.lastHostFuel,
+                static_cast<unsigned long long>(
+                    e.haveLastHostFuel && nowMs >= e.lastHostFuelMs
+                        ? nowMs - e.lastHostFuelMs : 0));
+
+            if (readable && std::isfinite(fuelState.fuel) &&
+                fuelState.fuel <= 0.01f && fresh &&
+                std::isfinite(e.lastHostFuel) &&
+                e.lastHostFuel > 0.1f) {
+                fuelState.fuel = e.lastHostFuel;
+                const bool written =
+                    ue_wrap::atv_condition::WriteAccumulators(
+                        e.actor, fuelState);
+                ue_wrap::atv_condition::Snapshot verify{};
+                const bool verified =
+                    ue_wrap::atv_condition::Read(e.actor, verify);
+                UE_LOGI(
+                    "atv_fuel_fix: REPAIR '%ls' written=%d verified=%d fuelAfter=%.2f",
+                    kv.first.c_str(), written ? 1 : 0,
+                    verified ? 1 : 0,
+                    verified ? verify.fuel : -1.0f);
+            }      
+            e.mountFuelCheckAtMs = nowMs + 3000;
+
+        }
+        e.wasLocalFuelDriver = isDriver;
+
+
+        if (e.mountFuelCheckAtMs != 0 &&
+            nowMs >= e.mountFuelCheckAtMs) {
+            e.mountFuelCheckAtMs = 0;
+
+            ue_wrap::atv_condition::Snapshot check{};
+            const bool ok =
+                ue_wrap::atv_condition::Read(e.actor, check);
+
+            UE_LOGI(
+                "atv_fuel_fix: CHECK+3S '%ls' driver=%d readable=%d fuel=%.2f cached=%d hostFuel=%.2f",
+                kv.first.c_str(),
+                isDriver ? 1 : 0,
+                ok ? 1 : 0,
+                ok ? check.fuel : -1.0f,
+                e.haveLastHostFuel ? 1 : 0,
+                e.lastHostFuel);
+        }
 
         // The authority-lost edge, with two causes handled oppositely: a dismount or ungrab frees
         // the ATV (the seat and author clear, and a release goes out); a yield (still seated, but

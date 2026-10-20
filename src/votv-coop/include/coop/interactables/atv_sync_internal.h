@@ -52,6 +52,15 @@ struct AtvEntry {
     ue_wrap::atv_condition::Snapshot condExpressed{};
     bool  condExpressedSeeded = false;
     void* condExpressedActor  = nullptr;  // reseed when the entry repoints to a new actor
+    
+    // Cache the latest host fuel state for a one-time mount repair.
+    float lastHostFuel = 0.0f;
+    uint64_t lastHostFuelMs = 0;
+    bool haveLastHostFuel = false;
+    bool wasLocalFuelDriver = false;
+    
+    uint64_t mountFuelCheckAtMs = 0;
+
     // Idle-syncer change gate, condition half: the payload's condition block as of the last
     // ACTUAL send. Pose-only gating would make a parked host eject wait out the 2 s keepalive.
     uint8_t lastSentCond[64] = {};
